@@ -1,0 +1,334 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no">
+<title>RepSense</title>
+<style>
+:root{--bg:#0f1115;--card:#181b22;--line:#2a2f3a;--txt:#e8eaf0;--mut:#8b93a4;--acc:#b6f24a;--bad:#ff6b6b}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+body{margin:0;background:var(--bg);color:var(--txt);font:16px/1.4 system-ui,sans-serif}
+.app{max-width:480px;margin:0 auto;padding:14px}
+h1{font-size:22px;margin:4px 0 10px;display:flex;justify-content:space-between;align-items:baseline}
+h1 small{font-size:12px;color:var(--mut);font-weight:400}
+button,.btn{background:var(--card);color:var(--txt);border:1px solid var(--line);border-radius:10px;padding:10px 14px;font-size:15px}
+button:active{opacity:.7}
+.big{width:100%;padding:14px;font-size:17px;font-weight:600;background:var(--acc);color:#111;border:0;margin:8px 0}
+.big.alt{background:var(--card);color:var(--txt);border:1px solid var(--line)}
+.tabs{display:flex;gap:6px;margin:10px 0}
+.tabs button{flex:1}
+.tabs button.on{background:var(--acc);color:#111;border-color:var(--acc);font-weight:600}
+section{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:14px}
+label.l{display:block;color:var(--mut);font-size:13px;margin:6px 0 4px}
+input[type=text],input[type=number]{width:100%;padding:10px;border-radius:10px;border:1px solid var(--line);background:var(--bg);color:var(--txt);font-size:16px}
+input[type=range]{width:100%}
+table{width:100%;border-collapse:collapse;margin:8px 0;font-size:14px}
+td,th{padding:5px 6px;border-bottom:1px solid var(--line);text-align:left}
+.row{display:flex;gap:8px;flex-wrap:wrap;margin-top:8px}
+.tip{color:var(--mut);font-size:13px}
+#status{min-height:22px;color:var(--acc);margin:4px 0}
+.rep{font-size:96px;font-weight:800;text-align:center;line-height:1;color:var(--acc)}
+.lab{font-size:26px;text-align:center;font-weight:700;margin-top:6px}
+.bar{height:8px;background:var(--bg);border-radius:6px;overflow:hidden;margin:8px 0}
+.bar i{display:block;height:100%;width:0;background:var(--acc)}
+.stats{color:var(--mut);font-size:13px;text-align:center}
+.cm td,.cm th{text-align:center;font-size:13px}
+.hit{background:#25331a}
+.err{color:var(--bad)}
+[hidden]{display:none!important}
+</style>
+</head>
+<body>
+<div class="app">
+  <h1>RepSense <small id="hz">sensor off</small></h1>
+  <button id="sensorBtn" class="big">1. Enable motion sensors</button>
+  <div class="tabs">
+    <button data-t="collect" class="on">Collect</button>
+    <button data-t="live">Live</button>
+    <button data-t="eval">Evaluate</button>
+  </div>
+
+  <section id="collect">
+    <label class="l">Exercise label (type a new one or pick)</label>
+    <input id="label" type="text" list="labels" value="idle">
+    <datalist id="labels"><option>idle</option><option>squat</option><option>pushup</option><option>jumping_jack</option><option>arm_circle</option></datalist>
+    <label class="l">Recording length (seconds)</label>
+    <input id="dur" type="number" value="20" min="8" max="60">
+    <button id="recBtn" class="big">2. Record</button>
+    <div id="status"></div>
+    <table id="counts"></table>
+    <div class="row">
+      <button id="exportBtn">Export data</button>
+      <label class="btn">Import<input id="importFile" type="file" accept=".json" hidden></label>
+      <button id="clearBtn">Clear all</button>
+    </div>
+    <p class="tip">Record 4-6 times per exercise (different takes), plus "idle" (hold still / walk about). Keep the phone in the same place each time: hand, armband or pocket. Name the still class exactly <b>idle</b>.</p>
+  </section>
+
+  <section id="live" hidden>
+    <div class="rep" id="repN">0</div>
+    <div class="lab" id="liveLabel">-</div>
+    <div class="bar"><i id="confBar"></i></div>
+    <div class="stats" id="liveStats">not running</div>
+    <table id="liveCounts"></table>
+    <button id="liveBtn" class="big">3. Start</button>
+    <div class="row">
+      <button id="resetBtn">Reset reps</button>
+    </div>
+    <label class="l">Rep sensitivity (higher = counts more)</label>
+    <input id="sens" type="range" min="0.1" max="1.2" step="0.05" value="0.5">
+    <p class="tip">If it misses reps, raise sensitivity. If it counts extras, lower it.</p>
+  </section>
+
+  <section id="eval" hidden>
+    <button id="evalBtn" class="big">Run evaluation</button>
+    <p class="tip">Leave-one-recording-out test: each recording is predicted using only the other recordings. Needs at least 2 recordings per label.</p>
+    <div id="evalOut"></div>
+  </section>
+</div>
+
+<script id="core">
+// ===== CORE (no DOM) =====
+const FS=50, WIN=2, WN=FS*WIN, STEP=0.5, K=5;
+const cfg={sens:0.5, minSd:0.35, refr:450};
+
+function mean(a){let s=0;for(const x of a)s+=x;return a.length?s/a.length:0}
+function std(a){const m=mean(a);let q=0;for(const x of a)q+=(x-m)*(x-m);return Math.sqrt(q/(a.length||1))}
+
+// samples: [{t(ms), v:[ax,ay,az,gx,gy,gz]}], returns WN x 6 resampled to FS Hz ending at tEnd
+function resample(samples,tEnd){
+  const out=[], t0=tEnd-WIN*1000;
+  let j=0;
+  for(let i=0;i<WN;i++){
+    const tt=t0+i*1000/FS;
+    while(j<samples.length-2 && samples[j+1].t<tt) j++;
+    const a=samples[j], b=samples[Math.min(j+1,samples.length-1)];
+    let f=(tt-a.t)/((b.t-a.t)||1); f=Math.max(0,Math.min(1,f));
+    out.push(a.v.map((x,k)=>x+(b.v[k]-x)*f));
+  }
+  return out;
+}
+function domFreq(x){
+  const m=mean(x); let best=0,bf=0;
+  for(let fr=0.3;fr<=5;fr+=0.1){
+    let re=0,im=0;
+    for(let i=0;i<x.length;i++){const ang=2*Math.PI*fr*i/FS;re+=(x[i]-m)*Math.cos(ang);im-=(x[i]-m)*Math.sin(ang)}
+    const p=re*re+im*im; if(p>best){best=p;bf=fr}
+  }
+  return bf;
+}
+function feats(w){
+  const f=[];
+  for(let c=0;c<6;c++){
+    let mn=1e9,mx=-1e9;const col=[];
+    for(const p of w){const x=p[c];col.push(x);if(x<mn)mn=x;if(x>mx)mx=x}
+    f.push(mean(col),std(col),mn,mx);
+  }
+  const am=w.map(p=>Math.hypot(p[0],p[1],p[2]));
+  const gm=w.map(p=>Math.hypot(p[3],p[4],p[5]));
+  f.push(std(am),std(gm),domFreq(am));
+  return f; // 27 features
+}
+
+// ---- dataset + kNN ----
+const D={samples:[],mu:[],sd:[]};
+function refit(){
+  const n=D.samples.length; if(!n){D.mu=[];D.sd=[];return}
+  const d=D.samples[0].x.length; D.mu=[];D.sd=[];
+  for(let i=0;i<d;i++){
+    const col=D.samples.map(s=>s.x[i]);
+    D.mu.push(mean(col)); D.sd.push(std(col)||1);
+  }
+  for(const s of D.samples) s.z=nz(s.x);
+}
+function nz(x){return x.map((v,i)=>(v-D.mu[i])/D.sd[i])}
+function dist(a,b){let s=0;for(let i=0;i<a.length;i++){const d=a[i]-b[i];s+=d*d}return s}
+function knn(z,pool){
+  const ds=pool.map(s=>({d:dist(z,s.z),y:s.y})).sort((a,b)=>a.d-b.d).slice(0,Math.min(K,pool.length));
+  const v={}; for(const n of ds) v[n.y]=(v[n.y]||0)+1;
+  let best=null,bc=-1; for(const k in v) if(v[k]>bc){bc=v[k];best=k}
+  return {label:best,conf:bc/ds.length};
+}
+function predict(x){return knn(nz(x),D.samples)}
+function evaluate(){
+  const labels=[...new Set(D.samples.map(s=>s.y))].sort();
+  const cm={}; labels.forEach(a=>{cm[a]={};labels.forEach(b=>cm[a][b]=0)});
+  let ok=0,n=0;
+  for(const s of D.samples){
+    const pool=D.samples.filter(o=>o.rec!==s.rec);
+    if(!pool.length) continue;
+    const p=knn(s.z,pool).label;
+    if(cm[s.y][p]===undefined) cm[s.y][p]=0;
+    cm[s.y][p]++; n++; if(p===s.y) ok++;
+  }
+  return {acc:n?ok/n:0,n,labels,cm};
+}
+
+// ---- rep counting (peak detection on smoothed accel magnitude) ----
+const R={ema:null,t:[],v:[],last:-1e9};
+let onRep=function(){};
+function repReset(){R.ema=null;R.t=[];R.v=[];R.last=-1e9}
+function repStep(t,v){
+  const m=Math.hypot(v[0],v[1],v[2]);
+  R.ema=R.ema===null?m:R.ema+0.25*(m-R.ema);
+  R.t.push(t);R.v.push(R.ema);
+  while(R.t.length&&R.t[0]<t-3000){R.t.shift();R.v.shift()}
+  const L=5,n=R.v.length; if(n<2*L+1) return;
+  const c=n-1-L, cv=R.v[c];
+  for(let i=c-L;i<=c+L;i++) if(R.v[i]>cv) return;
+  const mu=mean(R.v), sd=std(R.v);
+  if(sd<cfg.minSd) return;
+  if(cv<mu+(1.3-cfg.sens)*sd*0.8) return;
+  if(R.t[c]-R.last<cfg.refr) return;
+  R.last=R.t[c]; onRep();
+}
+</script>
+
+<script id="ui">
+// ===== UI =====
+const $=id=>document.getElementById(id);
+const sleep=ms=>new Promise(r=>setTimeout(r,ms));
+let buf=[], recBuf=[], recording=false, sensorOn=false, live=false, evCount=0, wake=null;
+let hist=[], curLabel=null, liveCounts={}, total=0, lastInfMs=0;
+
+// persistence
+function save(){try{localStorage.setItem('repsense',JSON.stringify(D.samples.map(s=>({x:s.x,y:s.y,rec:s.rec}))))}catch(e){}}
+function load(){try{const j=JSON.parse(localStorage.getItem('repsense')||'[]');D.samples=j;refit()}catch(e){}}
+function renderCounts(){
+  const c={},r={};
+  D.samples.forEach(s=>{c[s.y]=(c[s.y]||0)+1;(r[s.y]=r[s.y]||new Set()).add(s.rec)});
+  let h='<tr><th>Label</th><th>Recordings</th><th>Windows</th></tr>';
+  for(const k of Object.keys(c).sort()) h+=`<tr><td>${k}</td><td>${r[k].size}</td><td>${c[k]}</td></tr>`;
+  $('counts').innerHTML=D.samples.length?h:'<tr><td class="tip">No data yet</td></tr>';
+}
+
+// sensors
+function onMotion(e){
+  const a=e.accelerationIncludingGravity, r=e.rotationRate;
+  if(!a||a.x===null) return;
+  const t=performance.now();
+  const v=[a.x||0,a.y||0,a.z||0,r?(r.alpha||0):0,r?(r.beta||0):0,r?(r.gamma||0):0];
+  evCount++;
+  buf.push({t,v});
+  while(buf.length&&t-buf[0].t>6000) buf.shift();
+  if(recording) recBuf.push({t,v});
+  if(live) repStep(t,v);
+}
+$('sensorBtn').onclick=async()=>{
+  try{
+    if(typeof DeviceMotionEvent!=='undefined'&&typeof DeviceMotionEvent.requestPermission==='function'){
+      const r=await DeviceMotionEvent.requestPermission();
+      if(r!=='granted'){alert('Motion permission denied');return}
+    }
+    if(!sensorOn){window.addEventListener('devicemotion',onMotion);sensorOn=true}
+    try{wake=await navigator.wakeLock.request('screen')}catch(e){}
+    $('sensorBtn').textContent='Sensors enabled';$('sensorBtn').classList.add('alt');
+    setTimeout(()=>{if(!evCount){$('hz').textContent='NO DATA';$('hz').className='err';
+      alert('No sensor data. Open this page over HTTPS (e.g. Netlify/GitHub Pages link), not as a local file.')}},2000);
+  }catch(e){alert('Sensor error: '+e.message)}
+};
+setInterval(()=>{if(sensorOn&&evCount){$('hz').textContent=evCount+' Hz';$('hz').className=''}evCount=0},1000);
+
+// tabs
+document.querySelectorAll('.tabs button').forEach(b=>b.onclick=()=>{
+  document.querySelectorAll('.tabs button').forEach(x=>x.classList.toggle('on',x===b));
+  ['collect','live','eval'].forEach(t=>$(t).hidden=(t!==b.dataset.t));
+});
+
+// record
+$('recBtn').onclick=async()=>{
+  if(!sensorOn){alert('Enable sensors first');return}
+  if(recording) return;
+  const label=$('label').value.trim().toLowerCase().replace(/\s+/g,'_');
+  if(!label){alert('Enter a label');return}
+  const dur=Math.max(8,Math.min(60,+$('dur').value||20));
+  $('recBtn').disabled=true;
+  for(let c=3;c>0;c--){$('status').textContent='Get ready... '+c;await sleep(1000)}
+  recBuf=[];recording=true;
+  const t0=performance.now();
+  const timer=setInterval(()=>{$('status').textContent=`Recording "${label}"... ${Math.max(0,dur-Math.round((performance.now()-t0)/1000))}s`},250);
+  await sleep(dur*1000);
+  recording=false;clearInterval(timer);
+  const rate=recBuf.length/dur;
+  if(rate<20){$('status').innerHTML=`<span class="err">Sensor only ${rate.toFixed(0)} Hz, too low. Try again.</span>`;$('recBtn').disabled=false;return}
+  const rec=Date.now(); let added=0;
+  const first=recBuf[0].t, last=recBuf[recBuf.length-1].t;
+  for(let te=first+WIN*1000;te<=last;te+=STEP*1000){
+    const seg=recBuf.filter(p=>p.t>=te-WIN*1000-100&&p.t<=te+100);
+    if(seg.length<5) continue;
+    D.samples.push({x:feats(resample(seg,te)),y:label,rec});added++;
+  }
+  refit();save();renderCounts();
+  $('status').textContent=`Saved ${added} windows for "${label}" (${rate.toFixed(0)} Hz)`;
+  $('recBtn').disabled=false;
+};
+$('exportBtn').onclick=()=>{
+  const b=new Blob([JSON.stringify(D.samples.map(s=>({x:s.x,y:s.y,rec:s.rec})))],{type:'application/json'});
+  const a=document.createElement('a');a.href=URL.createObjectURL(b);a.download='repsense_data.json';a.click();
+};
+$('importFile').onchange=async e=>{
+  try{const j=JSON.parse(await e.target.files[0].text());D.samples=D.samples.concat(j);refit();save();renderCounts()}catch(err){alert('Bad file')}
+};
+$('clearBtn').onclick=()=>{if(confirm('Delete all recorded data?')){D.samples=[];refit();save();renderCounts()}};
+
+// live
+function renderLive(){
+  $('repN').textContent=total;
+  let h='';for(const k of Object.keys(liveCounts).sort()) h+=`<tr><td>${k}</td><td>${liveCounts[k]}</td></tr>`;
+  $('liveCounts').innerHTML=h;
+}
+onRep=function(){
+  if(D.samples.length&&curLabel&&curLabel==='idle') return;
+  total++;
+  const k=curLabel||'reps';liveCounts[k]=(liveCounts[k]||0)+1;
+  try{navigator.vibrate(25)}catch(e){}
+  renderLive();
+};
+$('sens').oninput=e=>{cfg.sens=+e.target.value};
+$('resetBtn').onclick=()=>{total=0;liveCounts={};repReset();renderLive()};
+let liveTimer=null;
+$('liveBtn').onclick=()=>{
+  if(!sensorOn){alert('Enable sensors first');return}
+  live=!live;
+  if(live){
+    repReset();hist=[];
+    $('liveBtn').textContent='Stop';
+    liveTimer=setInterval(()=>{
+      if(!D.samples.length){$('liveLabel').textContent='(counting only, no model)';return}
+      if(buf.length<20) return;
+      const te=buf[buf.length-1].t;
+      const seg=buf.filter(p=>p.t>=te-WIN*1000-100);
+      if(seg[seg.length-1].t-seg[0].t<WIN*1000-300) return;
+      const t0=performance.now();
+      const p=predict(feats(resample(seg,te)));
+      lastInfMs=performance.now()-t0;
+      hist.push(p.label);if(hist.length>3)hist.shift();
+      const c={};hist.forEach(l=>c[l]=(c[l]||0)+1);
+      curLabel=Object.keys(c).sort((a,b)=>c[b]-c[a])[0];
+      $('liveLabel').textContent=curLabel;
+      $('confBar').style.width=(p.conf*100)+'%';
+      const kb=(D.samples.length*27*4/1024).toFixed(1);
+      $('liveStats').textContent=`inference ${lastInfMs.toFixed(1)} ms | model ${D.samples.length} pts ~${kb} KB | on-device`;
+    },500);
+  }else{
+    clearInterval(liveTimer);$('liveBtn').textContent='3. Start';$('liveStats').textContent='stopped';
+  }
+};
+
+// evaluate
+$('evalBtn').onclick=()=>{
+  const recs=new Set(D.samples.map(s=>s.rec));
+  if(recs.size<2){$('evalOut').innerHTML='<p class="err">Need at least 2 recordings.</p>';return}
+  const r=evaluate();
+  let h=`<h3>Accuracy: ${(r.acc*100).toFixed(1)}% <small>(${r.n} windows)</small></h3>`;
+  h+='<p class="tip">Rows = actual, columns = predicted</p><table class="cm"><tr><th></th>'+r.labels.map(l=>`<th>${l}</th>`).join('')+'</tr>';
+  for(const a of r.labels){
+    h+=`<tr><th>${a}</th>`+r.labels.map(b=>`<td class="${a===b?'hit':''}">${r.cm[a][b]||0}</td>`).join('')+'</tr>';
+  }
+  $('evalOut').innerHTML=h+'</table>';
+};
+
+load();renderCounts();renderLive();
+</script>
+</body>
+</html>
